@@ -87,6 +87,108 @@ pub struct Disabled;
 
 pub struct Unknown;
 
+pub struct LedcPwm;
+pub struct LedcPwmChannel(ledc_channel_t);
+
+pub struct McPwm;
+pub struct McPwmChannel(mcpwm_unit_t, mcpwm_generator_t);
+
+pub type PwmDuty = u32;
+
+pub struct McPwmPin {
+    unit: mcpwm_unit_t,
+    timer: mcpwm_timer_t,
+    generator: mcpwm_generator_t,
+    _pin: GpioPin<McPwm>,
+}
+
+pub struct LedcPwmPin {
+    channel: ledc_channel_t,
+    speed_mode: ledc_mode_t,
+    _pin: GpioPin<LedcPwm>,
+}
+
+pub trait PwmPinWithMicros: embedded_hal::pwm::blocking::PwmPin {
+    fn set_duty_micros(&mut self, duty: u32) -> Result<(), EspError>;
+}
+
+impl embedded_hal::pwm::blocking::PwmPin for LedcPwmPin {
+    type Duty = PwmDuty;
+    type Error = EspError;
+
+    fn disable(&mut self) -> Result<(), EspError> {
+        Ok(())
+    }
+
+    /// Enables a PWM `channel`
+    fn enable(&mut self) -> Result<(), EspError> {
+        Ok(())
+    }
+
+    /// Returns the current duty cycle
+    fn get_duty(&self) -> Result<Self::Duty, EspError> {
+        Ok(unsafe { ledc_get_duty(self.speed_mode, self.channel) })
+    }
+
+    /// Returns the maximum duty cycle value
+    fn get_max_duty(&self) -> Result<Self::Duty, EspError> {
+        Ok(2_u32.pow(ledc_timer_bit_t_LEDC_TIMER_13_BIT))
+    }
+
+    /// Sets a new duty cycle
+    #[inline]
+    fn set_duty(&mut self, duty: Self::Duty) -> Result<(), EspError> {
+        esp!(unsafe { ledc_set_duty(self.speed_mode, self.channel, duty) })?;
+        esp!(unsafe { ledc_update_duty(self.speed_mode, self.channel) })
+    }
+}
+
+impl embedded_hal::pwm::blocking::PwmPin for McPwmPin {
+    type Duty = PwmDuty;
+    type Error = EspError;
+
+    fn disable(&mut self) -> Result<(), EspError> {
+        esp!(unsafe { mcpwm_set_signal_low(self.unit, self.timer, self.generator) })
+    }
+
+    /// Enables a PWM `channel`
+    fn enable(&mut self) -> Result<(), EspError> {
+        esp!(unsafe {
+            mcpwm_set_duty_type(
+                self.unit,
+                self.timer,
+                self.generator,
+                mcpwm_duty_type_t_MCPWM_DUTY_MODE_0,
+            )
+        })
+    }
+
+    /// Returns the current duty cycle
+    fn get_duty(&self) -> Result<Self::Duty, EspError> {
+        let duty = unsafe { mcpwm_get_duty(self.unit, self.timer, self.generator) };
+        Ok((duty * self.get_max_duty()? as f32).round() as u32)
+    }
+
+    /// Returns the maximum duty cycle value
+    fn get_max_duty(&self) -> Result<Self::Duty, EspError> {
+        Ok(Self::Duty::MAX)
+    }
+
+    /// Sets a new duty cycle
+    #[inline]
+    fn set_duty(&mut self, duty: Self::Duty) -> Result<(), EspError> {
+        let duty = duty as f32 / Self::Duty::MAX as f32 * 100.;
+        esp!(unsafe { mcpwm_set_duty(self.unit, self.timer, self.generator, duty) })
+    }
+}
+
+impl PwmPinWithMicros for McPwmPin {
+    #[inline]
+    fn set_duty_micros(&mut self, duty: u32) -> Result<(), EspError> {
+        esp!(unsafe { mcpwm_set_duty_in_us(self.unit, self.timer, self.generator, duty) })
+    }
+}
+
 /// Drive strength (values are approximates)
 #[cfg(not(feature = "riscv-ulp-hal"))]
 pub enum DriveStrength {
@@ -369,6 +471,83 @@ macro_rules! impl_input_output {
                 self.set_input_output_od()?;
 
                 Ok($pxi { _mode: PhantomData })
+            }
+
+            pub fn into_mcpwm(self, channel: McPwmChannel) -> Result<McPwmPin, EspError> {
+                // Reference: https://github.com/espressif/esp-idf/blob/733fbd9ecc8ac0780de51b3761a16d1faec63644/examples/peripherals/mcpwm/mcpwm_servo_control/main/mcpwm_servo_control_example_main.c
+                // This gives us 4 pwm outputs on the esp32:
+                // Unit 0 generator A
+                // Unit 0 generator B
+                // Unit 1 generator A
+                // Unit 1 generator B
+                let unit = channel.0;
+                let generator = channel.1;
+                let gpio_pin = self.pin();
+                let duty_mode = mcpwm_duty_type_t_MCPWM_DUTY_MODE_0;
+                let timer = mcpwm_timer_t_MCPWM_TIMER_0;
+                #[allow(non_upper_case_globals)]
+                let pwm_pin = match generator {
+                    mcpwm_generator_t_MCPWM_GEN_A => mcpwm_io_signals_t_MCPWM0A,
+                    mcpwm_generator_t_MCPWM_GEN_B => mcpwm_io_signals_t_MCPWM0B,
+                    _ => panic!("Unexpected generator"),
+                };
+                let pwm_config = mcpwm_config_t {
+                    frequency: 50, // frequency = 50Hz, i.e. for every servo motor time period should be 20ms
+                    cmpr_a: 0.,    // duty cycle of PWMxA = 0
+                    cmpr_b: 0.,
+                    counter_mode: mcpwm_counter_type_t_MCPWM_UP_COUNTER,
+                    duty_mode,
+                };
+                esp!(unsafe { mcpwm_gpio_init(unit, pwm_pin, gpio_pin) })?;
+                esp!(unsafe { mcpwm_init(unit, timer, &pwm_config) })?;
+                Ok(McPwmPin {
+                    unit,
+                    timer,
+                    generator,
+                    _pin: $pxi {
+                        _mode: PhantomData::<McPwm>,
+                    }
+                    .degrade(),
+                })
+            }
+
+            pub fn into_ledcpwm(self, channel: LedcPwmChannel) -> Result<LedcPwmPin, EspError> {
+                // Reference:
+                // https://github.com/espressif/esp-idf/blob/6cb6087dd0170cd534d8ad68ee2f8740a33368f9/examples/peripherals/ledc/ledc_basic/main/ledc_basic_example_main.c
+                // https://github.com/espressif/arduino-esp32/blob/master/cores/esp32/esp32-hal-ledc.c
+                let channel = channel.0;
+                let speed_mode = ledc_mode_t_LEDC_LOW_SPEED_MODE;
+                let ledc_timer = ledc_timer_config_t {
+                    speed_mode,
+                    timer_num: ledc_timer_t_LEDC_TIMER_0,
+                    __bindgen_anon_1: ledc_timer_config_t__bindgen_ty_1 {
+                        duty_resolution: ledc_timer_bit_t_LEDC_TIMER_13_BIT,
+                    },
+                    freq_hz: 5000, // Set output frequency at 5 kHz
+                    clk_cfg: ledc_clk_cfg_t_LEDC_AUTO_CLK,
+                };
+                let ledc_channel = ledc_channel_config_t {
+                    speed_mode,
+                    channel,
+                    timer_sel: ledc_timer_t_LEDC_TIMER_0,
+                    intr_type: ledc_intr_type_t_LEDC_INTR_DISABLE,
+                    gpio_num: self.pin(),
+                    duty: 0, // Set duty to 0%
+                    hpoint: 0,
+                    flags: ledc_channel_config_t__bindgen_ty_1 {
+                        ..Default::default()
+                    },
+                };
+                esp!(unsafe { ledc_timer_config(&ledc_timer) })?;
+                esp!(unsafe { ledc_channel_config(&ledc_channel) })?;
+                Ok(LedcPwmPin {
+                    channel,
+                    speed_mode,
+                    _pin: $pxi {
+                        _mode: PhantomData::<LedcPwm>,
+                    }
+                    .degrade(),
+                })
             }
 
             pub fn into_output(mut self) -> Result<$pxi<Output>, EspError> {
@@ -872,6 +1051,18 @@ mod chip {
         pub gpio37: Gpio37<Unknown>,
         pub gpio38: Gpio38<Unknown>,
         pub gpio39: Gpio39<Unknown>,
+        pub mcpwm_unit_0_gen_a: McPwmChannel,
+        pub mcpwm_unit_0_gen_b: McPwmChannel,
+        pub mcpwm_unit_1_gen_a: McPwmChannel,
+        pub mcpwm_unit_1_gen_b: McPwmChannel,
+        pub ledc_channel_0: LedcPwmChannel,
+        pub ledc_channel_1: LedcPwmChannel,
+        pub ledc_channel_2: LedcPwmChannel,
+        pub ledc_channel_3: LedcPwmChannel,
+        pub ledc_channel_4: LedcPwmChannel,
+        pub ledc_channel_5: LedcPwmChannel,
+        pub ledc_channel_6: LedcPwmChannel,
+        pub ledc_channel_7: LedcPwmChannel,
     }
 
     impl Pins {
@@ -931,6 +1122,30 @@ mod chip {
                 gpio37: Gpio37::<Unknown>::new(),
                 gpio38: Gpio38::<Unknown>::new(),
                 gpio39: Gpio39::<Unknown>::new(),
+                ledc_channel_0: LedcPwmChannel(ledc_channel_t_LEDC_CHANNEL_0),
+                ledc_channel_1: LedcPwmChannel(ledc_channel_t_LEDC_CHANNEL_1),
+                ledc_channel_2: LedcPwmChannel(ledc_channel_t_LEDC_CHANNEL_2),
+                ledc_channel_3: LedcPwmChannel(ledc_channel_t_LEDC_CHANNEL_3),
+                ledc_channel_4: LedcPwmChannel(ledc_channel_t_LEDC_CHANNEL_4),
+                ledc_channel_5: LedcPwmChannel(ledc_channel_t_LEDC_CHANNEL_5),
+                ledc_channel_6: LedcPwmChannel(ledc_channel_t_LEDC_CHANNEL_6),
+                ledc_channel_7: LedcPwmChannel(ledc_channel_t_LEDC_CHANNEL_7),
+                mcpwm_unit_0_gen_a: McPwmChannel(
+                    mcpwm_unit_t_MCPWM_UNIT_0,
+                    mcpwm_generator_t_MCPWM_GEN_A,
+                ),
+                mcpwm_unit_0_gen_b: McPwmChannel(
+                    mcpwm_unit_t_MCPWM_UNIT_0,
+                    mcpwm_generator_t_MCPWM_GEN_B,
+                ),
+                mcpwm_unit_1_gen_a: McPwmChannel(
+                    mcpwm_unit_t_MCPWM_UNIT_1,
+                    mcpwm_generator_t_MCPWM_GEN_A,
+                ),
+                mcpwm_unit_1_gen_b: McPwmChannel(
+                    mcpwm_unit_t_MCPWM_UNIT_1,
+                    mcpwm_generator_t_MCPWM_GEN_B,
+                ),
             }
         }
     }
