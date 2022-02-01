@@ -192,15 +192,17 @@ macro_rules! impl_base {
             }
 
             fn set_input(&mut self) -> Result<(), EspError> {
-                self.reset()?;
-                esp!(unsafe { gpio_set_direction(self.pin(), gpio_mode_t_GPIO_MODE_INPUT) })?;
+                esp!(unsafe {
+                    gpio_pad_select_gpio(self.pin() as u8);
+                    gpio_set_direction(self.pin(), gpio_mode_t_GPIO_MODE_INPUT)
+                })?;
 
                 Ok(())
             }
 
             fn set_input_output(&mut self) -> Result<(), EspError> {
-                self.reset()?;
                 esp!(unsafe {
+                    gpio_pad_select_gpio(self.pin() as u8);
                     gpio_set_direction(self.pin(), gpio_mode_t_GPIO_MODE_INPUT_OUTPUT)
                 })?;
 
@@ -208,8 +210,8 @@ macro_rules! impl_base {
             }
 
             fn set_input_output_od(&mut self) -> Result<(), EspError> {
-                self.reset()?;
                 esp!(unsafe {
+                    gpio_pad_select_gpio(self.pin() as u8);
                     gpio_set_direction(self.pin(), gpio_mode_t_GPIO_MODE_INPUT_OUTPUT_OD)
                 })?;
 
@@ -217,15 +219,19 @@ macro_rules! impl_base {
             }
 
             fn set_output(&mut self) -> Result<(), EspError> {
-                self.reset()?;
-                esp!(unsafe { gpio_set_direction(self.pin(), gpio_mode_t_GPIO_MODE_OUTPUT,) })?;
+                esp!(unsafe {
+                    gpio_pad_select_gpio(self.pin() as u8);
+                    gpio_set_direction(self.pin(), gpio_mode_t_GPIO_MODE_OUTPUT)
+                })?;
 
                 Ok(())
             }
 
             fn set_output_od(&mut self) -> Result<(), EspError> {
-                self.reset()?;
-                esp!(unsafe { gpio_set_direction(self.pin(), gpio_mode_t_GPIO_MODE_OUTPUT_OD,) })?;
+                esp!(unsafe {
+                    gpio_pad_select_gpio(self.pin() as u8);
+                    gpio_set_direction(self.pin(), gpio_mode_t_GPIO_MODE_OUTPUT_OD)
+                })?;
 
                 Ok(())
             }
